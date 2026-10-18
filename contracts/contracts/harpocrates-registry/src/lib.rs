@@ -357,6 +357,80 @@ pub struct VerifierCircuitVersions {
     pub set_at: u64,
 }
 
+/// Configuration snapshot for verifier-backed operations.
+///
+/// Loaded once at the start of verified registration calls to reduce repeated
+/// storage reads across validation helpers.
+#[derive(Clone, Debug)]
+pub struct VerifierContext {
+    pub verifier: Option<Address>,
+    pub circuit_versions: (u32, u32),
+}
+
+impl VerifierContext {
+    pub fn load(env: &Env) -> Self {
+        let verifier = env.storage().persistent().get(&DataKey::Verifier);
+        let circuit_versions = get_verifier_circuit_versions_raw(env);
+        Self {
+            verifier,
+            circuit_versions,
+        }
+    }
+
+    pub fn verifier(&self, env: &Env) -> &Address {
+        self.verifier
+            .as_ref()
+            .unwrap_or_else(|| panic_with_error!(env, RegistryError::VerifierNotSet))
+    }
+
+    pub fn require_supported_circuit_version(&self, env: &Env, circuit_version: u32) {
+        if circuit_version < MIN_SUPPORTED_CIRCUIT_VERSION
+            || circuit_version > MAX_SUPPORTED_CIRCUIT_VERSION
+        {
+            panic_with_error!(env, RegistryError::UnsupportedCircuitVersion);
+        }
+
+        let (min_version, max_version) = self.circuit_versions;
+        if circuit_version < min_version || circuit_version > max_version {
+            panic_with_error!(env, RegistryError::UnsupportedCircuitVersion);
+        }
+    }
+
+    pub fn require_verified_proof(
+        &self,
+        env: &Env,
+        circuit_version: u32,
+        public_inputs: Bytes,
+        proof: Bytes,
+    ) {
+        self.require_supported_circuit_version(env, circuit_version);
+
+        if proof.is_empty() {
+            panic_with_error!(env, RegistryError::InvalidProof);
+        }
+
+        let verifier = self.verifier(env);
+        if !verify_external_proof(env, verifier, public_inputs, proof) {
+            panic_with_error!(env, RegistryError::InvalidProof);
+        }
+    }
+
+    pub fn has_nullifier(&self, env: &Env, nullifier: &BytesN<32>) -> bool {
+        if let Some(ref verifier) = self.verifier {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::VerifierNullifier(verifier.clone(), nullifier.clone()))
+            {
+                return true;
+            }
+        }
+        env.storage()
+            .persistent()
+            .has(&DataKey::Nullifier(nullifier.clone()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Timelocked verifier and policy administration (#86)
 // ---------------------------------------------------------------------------
@@ -2556,6 +2630,7 @@ impl HarpocratesRegistry {
         public_inputs: Bytes,
         proof: Bytes,
     ) -> ProofRecord {
+        let verifier_ctx = VerifierContext::load(&env);
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER1_REGISTRATION);
         require_unique(&env, &proof_id, &video_hash);
 
@@ -2585,14 +2660,12 @@ impl HarpocratesRegistry {
                 panic_with_error!(&env, RegistryError::StaleEpoch);
             }
 
-            let verifier: Address = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Verifier)
-                .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-            require_verified_proof(
+            let verifier = verifier_ctx.verifier(&env);
+            if verifier_ctx.has_nullifier(&env, &parsed.nullifier) {
+                panic_with_error!(&env, RegistryError::DuplicateNullifier);
+            }
+            verifier_ctx.require_verified_proof(
                 &env,
-                &verifier,
                 CIRCUIT_VERSION_SILENT_WITNESS_V2,
                 public_inputs,
                 proof,
@@ -2600,7 +2673,7 @@ impl HarpocratesRegistry {
 
             env.storage()
                 .persistent()
-                .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier.clone(), parsed.nullifier.clone()), &true);
 
             let expires_at = compute_expires_at(&env);
             save_record(
@@ -2631,14 +2704,12 @@ impl HarpocratesRegistry {
             }
             require_active_credential_root(&env, &parsed.credential_root);
 
-            let verifier: Address = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Verifier)
-                .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-            require_verified_proof(
+            let verifier = verifier_ctx.verifier(&env);
+            if verifier_ctx.has_nullifier(&env, &parsed.nullifier) {
+                panic_with_error!(&env, RegistryError::DuplicateNullifier);
+            }
+            verifier_ctx.require_verified_proof(
                 &env,
-                &verifier,
                 CIRCUIT_VERSION_SILENT_WITNESS_V1,
                 public_inputs,
                 proof,
@@ -2646,7 +2717,7 @@ impl HarpocratesRegistry {
 
             env.storage()
                 .persistent()
-                .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier.clone(), parsed.nullifier.clone()), &true);
 
             let expires_at = compute_expires_at(&env);
             save_record(
@@ -2714,6 +2785,7 @@ impl HarpocratesRegistry {
         proof: Bytes,
         video_hashes: soroban_sdk::Vec<BytesN<32>>,
     ) -> soroban_sdk::Vec<ProofRecord> {
+        let verifier_ctx = VerifierContext::load(&env);
         let batch_size = video_hashes.len();
 
         if batch_size == 0 || batch_size > MAX_AGGREGATION_SIZE {
@@ -2733,14 +2805,9 @@ impl HarpocratesRegistry {
         // 2. Verify the aggregated UltraHonk proof through the configured
         //    verifier contract, validating the aggregation circuit version at
         //    the trust boundary first.
-        let verifier: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Verifier)
-            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-        require_verified_proof(
+        let verifier = verifier_ctx.verifier(&env);
+        verifier_ctx.require_verified_proof(
             &env,
-            &verifier,
             CIRCUIT_VERSION_AGGREGATION,
             public_inputs,
             proof,
@@ -2794,24 +2861,12 @@ impl HarpocratesRegistry {
             }
 
             // Check nullifier uniqueness.
-            let verifier: Address = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Verifier)
-                .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-
-            if Self::has_nullifier(env.clone(), verifier.clone(), element.nullifier.clone()) {
+            if verifier_ctx.has_nullifier(&env, &element.nullifier) {
                 panic_with_error!(&env, RegistryError::DuplicateNullifier);
             }
         }
 
         // All checks passed — persist every element.
-        let verifier: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Verifier)
-            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-
         for i in 0..batch_size {
             let element = &parsed.elements[i as usize];
             let video_hash = video_hashes.get(i).unwrap();
