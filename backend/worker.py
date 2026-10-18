@@ -17,7 +17,7 @@ from db import (
     update_tx_status,
 )
 from envelope import canonical_metadata_hash
-from stego import embed_metadata, extract_metadata, sha256_file
+from stego import StegoLimitExceededError, embed_metadata, extract_metadata, sha256_file
 from noir import generate_silent_witness
 from app import safe_filename, redact_metadata
 from app import normalize_filename, redact_metadata
@@ -247,7 +247,7 @@ def run_worker():
                 LOGGER.error(f"Failed job {job_id}: {e}")
                 LOGGER.error(traceback.format_exc())
                 # Dependency / Horizon failures on verify_tx are retryable.
-                is_fatal = isinstance(e, ValueError) and job_type != "verify_tx"
+                is_fatal = (isinstance(e, ValueError) and job_type != "verify_tx") or isinstance(e, StegoLimitExceededError)
                 if job_type == "verify_tx":
                     is_fatal = isinstance(e, ValueError)
                 fail_job(job_id, str(e), is_fatal=is_fatal)

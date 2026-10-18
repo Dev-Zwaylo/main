@@ -52,10 +52,14 @@ class AppConfig:
     verifier_cache_max_size: int
     verifier_cache_positive_ttl_seconds: float
     verifier_cache_negative_ttl_seconds: float
+    # Stego process pool and resource limits
+    stego_memory_limit_bytes: int = 536_870_912
+    stego_cpu_limit_seconds: int = 60
+    stego_pool_max_workers: int = 4
     # External evidence fetch safety bounds
-    external_fetch_connect_timeout_seconds: float
-    external_fetch_read_timeout_seconds: float
-    external_fetch_max_response_bytes: int
+    external_fetch_connect_timeout_seconds: float = 5.0
+    external_fetch_read_timeout_seconds: float = 10.0
+    external_fetch_max_response_bytes: int = 65_536
     # Owner-scoped credentials: each key may only register its own sourceAddress.
     register_scoped_keys: tuple[ScopedKey, ...] = ()
 
@@ -125,6 +129,9 @@ def load_config() -> AppConfig:
         verifier_cache_max_size=_int_env("VERIFIER_CACHE_MAX_SIZE", 10000),
         verifier_cache_positive_ttl_seconds=_float_env("VERIFIER_CACHE_POSITIVE_TTL_SECONDS", 86400.0),
         verifier_cache_negative_ttl_seconds=_float_env("VERIFIER_CACHE_NEGATIVE_TTL_SECONDS", 300.0),
+        stego_memory_limit_bytes=_int_env("STEGO_MEMORY_LIMIT_BYTES", 536_870_912),
+        stego_cpu_limit_seconds=_int_env("STEGO_CPU_LIMIT_SECONDS", 60),
+        stego_pool_max_workers=_int_env("STEGO_POOL_MAX_WORKERS", 4),
         external_fetch_connect_timeout_seconds=_float_env("EXTERNAL_FETCH_CONNECT_TIMEOUT_SECONDS", 5.0),
         external_fetch_read_timeout_seconds=_float_env("EXTERNAL_FETCH_READ_TIMEOUT_SECONDS", 10.0),
         external_fetch_max_response_bytes=_int_env("EXTERNAL_FETCH_MAX_RESPONSE_BYTES", 65_536),

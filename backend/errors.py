@@ -59,6 +59,9 @@ classify_cli_error = lambda x: x
 PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
 """Legacy payload-limit code retained for compatibility (413)."""
 
+STEGO_LIMIT_EXCEEDED = "STEGO_LIMIT_EXCEEDED"
+"""Steganography processing exceeded configured memory or CPU limits (413)."""
+
 NOT_FOUND = "NOT_FOUND"
 """The requested resource or capability is unavailable (404)."""
 

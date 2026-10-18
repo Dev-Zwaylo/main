@@ -27,6 +27,7 @@ class MetricsCollector:
         self._cache_misses = 0
         self._cache_evictions = 0
         self._deleted_events = 0
+        self._stego_limit_breaches: Dict[str, int] = {}
 
     def reset(self) -> None:
         """Reset all metrics to clean state (primarily for unit testing)."""
@@ -40,6 +41,7 @@ class MetricsCollector:
             self._cache_misses = 0
             self._cache_evictions = 0
             self._deleted_events = 0
+            self._stego_limit_breaches.clear()
 
     def record_request(
         self,
@@ -121,6 +123,12 @@ class MetricsCollector:
         """Record a proof event removed by the retention worker."""
         with self._lock:
             self._deleted_events += 1
+
+    def record_stego_limit_breach(self, operation: str) -> None:
+        """Record a resource limit breach in steganography processing."""
+        clean_op = (operation or "unknown").strip().lower()
+        with self._lock:
+            self._stego_limit_breaches[clean_op] = self._stego_limit_breaches.get(clean_op, 0) + 1
 
     def record_dependency_status(self, name: str, status: str, critical: bool) -> None:
         """Record the latest bounded readiness state for one dependency."""
@@ -226,6 +234,12 @@ class MetricsCollector:
             lines.append("# HELP harpocrates_retention_deleted_events_total Total proof events removed by retention.")
             lines.append("# TYPE harpocrates_retention_deleted_events_total counter")
             lines.append(f"harpocrates_retention_deleted_events_total {self._deleted_events}")
+
+            lines.append("")
+            lines.append("# HELP harpocrates_stego_limit_breaches_total Total steganography resource limit breaches.")
+            lines.append("# TYPE harpocrates_stego_limit_breaches_total counter")
+            for op, count in sorted(self._stego_limit_breaches.items()):
+                lines.append(f'harpocrates_stego_limit_breaches_total{{operation="{_escape_label(op)}"}} {count}')
 
         lines.append("")
         return "\n".join(lines)

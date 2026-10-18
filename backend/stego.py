@@ -50,11 +50,92 @@ def canonical_metadata_hash_compat(metadata: dict[str, Any]) -> str:
     return canonical_metadata_hash(metadata)
 
 
-@traced("media.embed", attributes={"media.operation": "embed"})
-def embed_metadata(source_path: Path | str, output_path: Path | str, metadata: dict[str, Any]) -> None:
+import warnings
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+
+from config import load_config
+from metrics import collector as metrics_collector
+
+
+class StegoError(RuntimeError):
+    """Base error for steganography processing failures."""
+
+
+class StegoLimitExceededError(StegoError):
+    """Raised when steganography processing exceeds CPU or memory resource limits."""
+
+
+_POOL_LOCK = threading.Lock()
+_POOL: ProcessPoolExecutor | None = None
+_POOL_CONFIG: tuple[int, int | None, int | None] | None = None
+
+
+def _init_stego_worker(memory_limit_bytes: int | None, cpu_limit_seconds: int | None) -> None:
+    if os.name != "nt":
+        try:
+            import resource
+
+            if memory_limit_bytes and memory_limit_bytes > 0:
+                resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+            if cpu_limit_seconds and cpu_limit_seconds > 0:
+                resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit_seconds, cpu_limit_seconds))
+        except (ImportError, ValueError, OSError) as exc:
+            warnings.warn(
+                f"Failed to set stego worker resource limits: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    else:
+        warnings.warn(
+            "Stego resource limits via resource.setrlimit are not supported on Windows; falling back to unconstrained execution.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def _get_stego_pool(
+    max_workers: int | None = None,
+    memory_limit_bytes: int | None = None,
+    cpu_limit_seconds: int | None = None,
+) -> ProcessPoolExecutor:
+    global _POOL, _POOL_CONFIG
+    cfg = load_config()
+    workers = max_workers if max_workers is not None else cfg.stego_pool_max_workers
+    mem_lim = memory_limit_bytes if memory_limit_bytes is not None else cfg.stego_memory_limit_bytes
+    cpu_lim = cpu_limit_seconds if cpu_limit_seconds is not None else cfg.stego_cpu_limit_seconds
+
+    current_config = (workers, mem_lim, cpu_lim)
+    with _POOL_LOCK:
+        if _POOL is not None and _POOL_CONFIG != current_config:
+            _POOL.shutdown(wait=False, cancel_futures=True)
+            _POOL = None
+
+        if _POOL is None:
+            _POOL = ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_stego_worker,
+                initargs=(mem_lim, cpu_lim),
+            )
+            _POOL_CONFIG = current_config
+        return _POOL
+
+
+def _reset_stego_pool() -> None:
+    """Helper for testing or reinitialization."""
+    global _POOL, _POOL_CONFIG
+    with _POOL_LOCK:
+        if _POOL is not None:
+            _POOL.shutdown(wait=False, cancel_futures=True)
+            _POOL = None
+            _POOL_CONFIG = None
+
+
+def _embed_metadata_process(source_path: str, output_path: str, metadata: dict[str, Any]) -> None:
     ffmpeg = _require("ffmpeg")
     info = _probe_video(source_path)
-    payload = pack_envelope(metadata)
+    version = metadata.get("version", 2)
+    payload = pack_envelope(metadata, version=version)
     bits = _bytes_to_bits(payload)
 
     border_capacity = _border_capacity(info.width, info.height) * (info.frame_count or 1)
@@ -96,8 +177,7 @@ def embed_metadata(source_path: Path | str, output_path: Path | str, metadata: d
         _close_process(process_out)
 
 
-@traced("media.extract", attributes={"media.operation": "extract"})
-def extract_metadata(source_path: Path | str) -> dict[str, Any] | None:
+def _extract_metadata_process(source_path: str) -> dict[str, Any] | None:
     ffmpeg = _require("ffmpeg")
     info = _probe_video(source_path)
     process = _start_decode(ffmpeg, source_path, info)
@@ -121,6 +201,68 @@ def extract_metadata(source_path: Path | str) -> dict[str, Any] | None:
     finally:
         timer.cancel()
         _close_process(process)
+
+
+@traced("media.embed", attributes={"media.operation": "embed"})
+def embed_metadata(
+    source_path: Path | str,
+    output_path: Path | str,
+    metadata: dict[str, Any],
+    *,
+    memory_limit_bytes: int | None = None,
+    cpu_limit_seconds: int | None = None,
+) -> None:
+    pool = _get_stego_pool(
+        memory_limit_bytes=memory_limit_bytes,
+        cpu_limit_seconds=cpu_limit_seconds,
+    )
+    future = pool.submit(
+        _embed_metadata_process,
+        str(source_path),
+        str(output_path),
+        metadata,
+    )
+    try:
+        future.result()
+    except BrokenProcessPool as exc:
+        _reset_stego_pool()
+        metrics_collector.record_stego_limit_breach("embed")
+        raise StegoLimitExceededError("Stego process exceeded resource limits during embedding") from exc
+    except MemoryError as exc:
+        metrics_collector.record_stego_limit_breach("embed")
+        raise StegoLimitExceededError("Stego process exceeded memory limit during embedding") from exc
+    except StegoLimitExceededError:
+        metrics_collector.record_stego_limit_breach("embed")
+        raise
+
+
+@traced("media.extract", attributes={"media.operation": "extract"})
+def extract_metadata(
+    source_path: Path | str,
+    *,
+    memory_limit_bytes: int | None = None,
+    cpu_limit_seconds: int | None = None,
+) -> dict[str, Any] | None:
+    pool = _get_stego_pool(
+        memory_limit_bytes=memory_limit_bytes,
+        cpu_limit_seconds=cpu_limit_seconds,
+    )
+    future = pool.submit(
+        _extract_metadata_process,
+        str(source_path),
+    )
+    try:
+        return future.result()
+    except BrokenProcessPool as exc:
+        _reset_stego_pool()
+        metrics_collector.record_stego_limit_breach("extract")
+        raise StegoLimitExceededError("Stego process exceeded resource limits during extraction") from exc
+    except MemoryError as exc:
+        metrics_collector.record_stego_limit_breach("extract")
+        raise StegoLimitExceededError("Stego process exceeded memory limit during extraction") from exc
+    except StegoLimitExceededError:
+        metrics_collector.record_stego_limit_breach("extract")
+        raise
 
 
 def _bytes_to_bits(data: bytes) -> list[int]:
