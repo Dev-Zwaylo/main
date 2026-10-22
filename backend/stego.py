@@ -11,7 +11,7 @@ import threading
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from tracing import traced
 
@@ -50,88 +50,18 @@ def canonical_metadata_hash_compat(metadata: dict[str, Any]) -> str:
     return canonical_metadata_hash(metadata)
 
 
-import warnings
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
+@traced("media.embed", attributes={"media.operation": "embed"})
+def embed_metadata(
+    source_path: Path | str,
+    output_path: Path | str,
+    metadata: dict[str, Any],
+    progress_callback: Callable[[int, int | None], None] | None = None,
+) -> None:
+    """Embed ``metadata`` into the video.
 
-from config import load_config
-from metrics import collector as metrics_collector
-
-
-class StegoError(RuntimeError):
-    """Base error for steganography processing failures."""
-
-
-class StegoLimitExceededError(StegoError):
-    """Raised when steganography processing exceeds CPU or memory resource limits."""
-
-
-_POOL_LOCK = threading.Lock()
-_POOL: ProcessPoolExecutor | None = None
-_POOL_CONFIG: tuple[int, int | None, int | None] | None = None
-
-
-def _init_stego_worker(memory_limit_bytes: int | None, cpu_limit_seconds: int | None) -> None:
-    if os.name != "nt":
-        try:
-            import resource
-
-            if memory_limit_bytes and memory_limit_bytes > 0:
-                resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
-            if cpu_limit_seconds and cpu_limit_seconds > 0:
-                resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit_seconds, cpu_limit_seconds))
-        except (ImportError, ValueError, OSError) as exc:
-            warnings.warn(
-                f"Failed to set stego worker resource limits: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-    else:
-        warnings.warn(
-            "Stego resource limits via resource.setrlimit are not supported on Windows; falling back to unconstrained execution.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
-
-def _get_stego_pool(
-    max_workers: int | None = None,
-    memory_limit_bytes: int | None = None,
-    cpu_limit_seconds: int | None = None,
-) -> ProcessPoolExecutor:
-    global _POOL, _POOL_CONFIG
-    cfg = load_config()
-    workers = max_workers if max_workers is not None else cfg.stego_pool_max_workers
-    mem_lim = memory_limit_bytes if memory_limit_bytes is not None else cfg.stego_memory_limit_bytes
-    cpu_lim = cpu_limit_seconds if cpu_limit_seconds is not None else cfg.stego_cpu_limit_seconds
-
-    current_config = (workers, mem_lim, cpu_lim)
-    with _POOL_LOCK:
-        if _POOL is not None and _POOL_CONFIG != current_config:
-            _POOL.shutdown(wait=False, cancel_futures=True)
-            _POOL = None
-
-        if _POOL is None:
-            _POOL = ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=_init_stego_worker,
-                initargs=(mem_lim, cpu_lim),
-            )
-            _POOL_CONFIG = current_config
-        return _POOL
-
-
-def _reset_stego_pool() -> None:
-    """Helper for testing or reinitialization."""
-    global _POOL, _POOL_CONFIG
-    with _POOL_LOCK:
-        if _POOL is not None:
-            _POOL.shutdown(wait=False, cancel_futures=True)
-            _POOL = None
-            _POOL_CONFIG = None
-
-
-def _embed_metadata_process(source_path: str, output_path: str, metadata: dict[str, Any]) -> None:
+    ``progress_callback(frames_done, frames_total)`` is called after each frame is
+    written; ``frames_total`` is ``None`` when ffprobe cannot report a frame count.
+    """
     ffmpeg = _require("ffmpeg")
     info = _probe_video(source_path)
     version = metadata.get("version", 2)
@@ -149,6 +79,7 @@ def _embed_metadata_process(source_path: str, output_path: str, metadata: dict[s
     timer_out = _kill_after_timeout(process_out, 60.0)
     frame_size = info.width * info.height * 3
     bit_cursor = 0
+    frames_done = 0
 
     try:
         while True:
@@ -162,6 +93,9 @@ def _embed_metadata_process(source_path: str, output_path: str, metadata: dict[s
             bit_cursor = _embed_border_bits(frame, bits, bit_cursor)
             _embed_lsb_bits(frame, bits)
             process_out.stdin.write(frame.tobytes())
+            frames_done += 1
+            if progress_callback is not None:
+                progress_callback(frames_done, info.frame_count)
 
         process_out.stdin.close()
         decode_status = process_in.wait(timeout=30)

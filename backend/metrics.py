@@ -31,7 +31,7 @@ class MetricsCollector:
         self._cache_misses = 0
         self._cache_evictions = 0
         self._deleted_events = 0
-        self._stego_limit_breaches: Dict[str, int] = {}
+        self._deleted_blobs = 0
 
         # Job queue backlog metrics (refreshed at most every N seconds)
         self._job_refresh_interval = (
@@ -56,6 +56,7 @@ class MetricsCollector:
             self._cache_misses = 0
             self._cache_evictions = 0
             self._deleted_events = 0
+            self._deleted_blobs = 0
             self._last_job_refresh = 0.0
             self._cached_job_counts.clear()
             self._cached_oldest_queued.clear()
@@ -216,11 +217,16 @@ class MetricsCollector:
         with self._lock:
             self._deleted_events += 1
 
-    def record_stego_limit_breach(self, operation: str) -> None:
-        """Record a resource limit breach in steganography processing."""
-        clean_op = (operation or "unknown").strip().lower()
+    def record_deleted_blob(self, count: int = 1) -> None:
+        """Record unreferenced evidence blob(s) deleted by retention."""
+        if count <= 0:
+            return
         with self._lock:
-            self._stego_limit_breaches[clean_op] = self._stego_limit_breaches.get(clean_op, 0) + 1
+            self._deleted_blobs += count
+
+    def record_deleted_blobs(self, count: int = 1) -> None:
+        """Alias for record_deleted_blob."""
+        self.record_deleted_blob(count)
 
     def record_dependency_status(self, name: str, status: str, critical: bool) -> None:
         """Record the latest bounded readiness state for one dependency."""
@@ -326,6 +332,12 @@ class MetricsCollector:
             lines.append("# HELP harpocrates_retention_deleted_events_total Total proof events removed by retention.")
             lines.append("# TYPE harpocrates_retention_deleted_events_total counter")
             lines.append(f"harpocrates_retention_deleted_events_total {self._deleted_events}")
+
+            lines.append("")
+            lines.append("# HELP harpocrates_retention_deleted_blobs_total Total evidence blobs removed by retention.")
+            lines.append("# TYPE harpocrates_retention_deleted_blobs_total counter")
+            lines.append(f"harpocrates_retention_deleted_blobs_total {self._deleted_blobs}")
+
 
             # 8. Job queue backlog and oldest-job age gauges (refreshed at most every N seconds)
             now = time.monotonic()
